@@ -581,6 +581,13 @@ class KiCADInterface:
         """Save board to disk after SWIG mutations.
         Called automatically after every board-mutating SWIG command so that
         data is not lost if Claude hits the context limit before save_project.
+
+        Note: pcbnew.SaveBoard() can corrupt the in-memory SwigPyObject in
+        KiCad 9.0+ (deprecated SWIG bindings). After save we reload the board
+        from disk and re-bind the command handlers, so the next mutation call
+        operates on a fresh, valid BOARD pointer instead of a degraded
+        SwigPyObject (which manifests as 'has no attribute FindFootprintByReference'
+        or 'has no attribute thisown' on the next call).
         """
         try:
             if self.board:
@@ -588,6 +595,11 @@ class KiCADInterface:
                 if board_path:
                     pcbnew.SaveBoard(board_path, self.board)
                     logger.debug(f"Auto-saved board to: {board_path}")
+                    # Reload to keep self.board a valid BOARD instance
+                    # (workaround for SWIG SwigPyObject degradation after Save)
+                    self.board = pcbnew.LoadBoard(board_path)
+                    self._update_command_handlers()
+                    logger.debug("Re-loaded board after auto-save (SWIG-stability)")
         except Exception as e:
             logger.warning(f"Auto-save failed: {e}")
 
