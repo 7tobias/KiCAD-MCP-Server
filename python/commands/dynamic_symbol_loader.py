@@ -412,6 +412,34 @@ class DynamicSymbolLoader:
         full_lib_id = f"{library_name}:{symbol_name}"
         new_uuid = str(uuid.uuid4())
 
+        with open(schematic_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Derive project name from .kicad_pro file in the schematic directory.
+        # KiCad's annotation/instance lookup matches on this name; using the
+        # placeholder "project" makes KiCad treat the symbol as un-annotated
+        # ("C?", "R?", etc.) when the file is reopened.
+        project_name = "project"
+        sch_dir = Path(schematic_path).parent
+        try:
+            pro_files = list(sch_dir.glob("*.kicad_pro"))
+            if pro_files:
+                project_name = pro_files[0].stem
+        except Exception:
+            pass
+
+        # Derive the schematic root UUID from the (kicad_sch ...) header.
+        # The instance path must reference this UUID (prefixed with "/") so KiCad's
+        # hierarchical lookup finds the symbol; "/" alone means the unnamed root and
+        # is rejected as un-annotated.
+        # Take the first (uuid "...") in the file — KiCad places the schematic
+        # root UUID before lib_symbols and any placed-symbol UUIDs.
+        root_uuid = None
+        m = re.search(r'\(uuid\s+"([0-9a-fA-F\-]+)"', content)
+        if m:
+            root_uuid = m.group(1)
+        instance_path = f"/{root_uuid}" if root_uuid else "/"
+
         instance_block = f"""  (symbol (lib_id "{full_lib_id}") (at {x} {y} 0) (unit {unit})
     (in_bom yes) (on_board yes) (dnp no)
     (uuid "{new_uuid}")
@@ -428,17 +456,14 @@ class DynamicSymbolLoader:
       (effects (font (size 1.27 1.27)) (hide yes))
     )
     (instances
-      (project "project"
-        (path "/"
+      (project "{project_name}"
+        (path "{instance_path}"
           (reference "{reference}")
           (unit {unit})
         )
       )
     )
   )"""
-
-        with open(schematic_path, "r", encoding="utf-8") as f:
-            content = f.read()
 
         # Insert before (sheet_instances using direct string search.
         # This works for both pretty-printed and sexpdata-compacted single-line files.
