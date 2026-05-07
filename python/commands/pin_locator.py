@@ -29,7 +29,14 @@ class PinLocator:
     @staticmethod
     def parse_symbol_definition(symbol_def: list) -> Dict[str, Dict]:
         """
-        Parse a symbol definition from lib_symbols to extract pin information
+        Parse a symbol definition from lib_symbols to extract pin information.
+
+        Tracks per-pin unit number for multi-unit symbols. KiCad nests sub-symbols
+        named "<base>_<unit>_<style>" (e.g. "KSZ8895MLUB_1_1", "KSZ8895MLUB_2_1")
+        inside the parent symbol; each sub-symbol contains pins belonging to that
+        unit. We extract the unit number from the sub-symbol name and tag each
+        pin with it. get_pin_location() then uses the pin's unit field to find
+        the matching schematic instance.
 
         Args:
             symbol_def: S-expression list representing symbol definition
@@ -37,16 +44,31 @@ class PinLocator:
         Returns:
             Dictionary mapping pin number -> pin data:
             {
-                "1": {"x": 0, "y": 3.81, "angle": 270, "length": 1.27, "name": "~", "type": "passive"},
-                "2": {"x": 0, "y": -3.81, "angle": 90, "length": 1.27, "name": "~", "type": "passive"}
+                "1": {"x": 0, "y": 3.81, "angle": 270, "length": 1.27,
+                       "name": "~", "type": "passive", "unit": 1},
+                "2": {"x": 0, "y": -3.81, "angle": 90, "length": 1.27,
+                       "name": "~", "type": "passive", "unit": 1}
             }
         """
+        import re as _re
         pins: Dict[str, Dict[str, Any]] = {}
 
-        def extract_pins_recursive(sexp: Any) -> None:
-            """Recursively search for pin definitions"""
+        def extract_pins_recursive(sexp: Any, current_unit: int = 1) -> None:
+            """Recursively search for pin definitions, tracking sub-symbol unit."""
             if not isinstance(sexp, list):
                 return
+
+            # Detect sub-symbol entry: (symbol "BASE_<unit>_<style>" ...)
+            # Update current_unit for the recursion into this sub-symbol's body.
+            if (
+                len(sexp) >= 2
+                and sexp[0] == Symbol("symbol")
+                and isinstance(sexp[1], (str, Symbol))
+            ):
+                sub_name = str(sexp[1]).strip('"')
+                m = _re.search(r"_(\d+)_\d+$", sub_name)
+                if m:
+                    current_unit = int(m.group(1))
 
             # Check if this is a pin definition
             if len(sexp) > 0 and sexp[0] == Symbol("pin"):
@@ -59,6 +81,7 @@ class PinLocator:
                     "name": "",
                     "number": "",
                     "type": str(sexp[1]) if len(sexp) > 1 else "passive",
+                    "unit": current_unit,
                 }
 
                 # Extract pin attributes
@@ -83,10 +106,10 @@ class PinLocator:
                 if pin_data["number"]:
                     pins[pin_data["number"]] = pin_data
 
-            # Recurse into sublists
+            # Recurse into sublists, propagating the current unit context
             for item in sexp:
                 if isinstance(item, list):
-                    extract_pins_recursive(item)
+                    extract_pins_recursive(item, current_unit)
 
         extract_pins_recursive(symbol_def)
         return pins
@@ -306,50 +329,30 @@ class PinLocator:
                 self._schematic_cache[sch_key] = Schematic(sch_key)
             sch = self._schematic_cache[sch_key]
 
-            # Find the symbol instance.
-            # skip may write references with a trailing "_" (e.g. "R1_") — strip it when comparing.
-            target_symbol = None
+            # First pass: collect all instances with the requested reference (handles
+            # multi-unit symbols where multiple instances share the same reference).
+            # skip may write references with a trailing "_" (e.g. "R1_") — strip it.
+            candidate_instances: List[object] = []
             for symbol in sch.symbol:
                 ref = symbol.property.Reference.value.rstrip("_")
                 if ref == symbol_reference:
-                    target_symbol = symbol
-                    break
+                    candidate_instances.append(symbol)
 
-            if not target_symbol:
+            if not candidate_instances:
                 logger.error(f"Symbol {symbol_reference} not found in schematic")
                 return None
 
-            # Get symbol position, rotation, and mirror state
-            symbol_at = target_symbol.at.value
-            symbol_x = float(symbol_at[0])
-            symbol_y = float(symbol_at[1])
-            symbol_rotation = float(symbol_at[2]) if len(symbol_at) > 2 else 0.0
-
-            mirror_x = False
-            mirror_y = False
-            if hasattr(target_symbol, "mirror"):
-                mirror_val = (
-                    str(target_symbol.mirror.value)
-                    if hasattr(target_symbol.mirror, "value")
-                    else ""
-                )
-                if mirror_val == "x":
-                    mirror_x = True
-                elif mirror_val == "y":
-                    mirror_y = True
-
-            # Get symbol lib_id
-            lib_id = target_symbol.lib_id.value if hasattr(target_symbol, "lib_id") else None
+            # Lookup the pin in the library to determine its unit. We need the
+            # lib_id from any candidate (all instances share the same lib_id).
+            lib_id = (
+                candidate_instances[0].lib_id.value
+                if hasattr(candidate_instances[0], "lib_id")
+                else None
+            )
             if not lib_id:
                 logger.error(f"Symbol {symbol_reference} has no lib_id")
                 return None
 
-            logger.debug(
-                f"Symbol {symbol_reference}: pos=({symbol_x}, {symbol_y}), rot={symbol_rotation}, "
-                f"mirror_x={mirror_x}, mirror_y={mirror_y}, lib_id={lib_id}"
-            )
-
-            # Get pin definitions for this symbol
             pins = self.get_symbol_pins(schematic_path, lib_id)
             if not pins:
                 logger.error(f"No pin definitions found for {lib_id}")
@@ -375,6 +378,54 @@ class PinLocator:
                     return None
 
             pin_data = pins[pin_number]
+            target_pin_unit = int(pin_data.get("unit", 1))
+
+            # Second pass: pick the candidate instance whose unit matches the pin's unit.
+            # For single-unit symbols all pins are unit=1 and any instance works.
+            target_symbol = None
+            for symbol in candidate_instances:
+                instance_unit = 1
+                if hasattr(symbol, "unit") and hasattr(symbol.unit, "value"):
+                    try:
+                        instance_unit = int(symbol.unit.value)
+                    except (TypeError, ValueError):
+                        instance_unit = 1
+                if instance_unit == target_pin_unit:
+                    target_symbol = symbol
+                    break
+
+            # Fallback: no matching unit found → use first candidate (preserves
+            # legacy behavior for symbols without explicit unit attribution).
+            if target_symbol is None:
+                target_symbol = candidate_instances[0]
+                logger.warning(
+                    f"No instance of {symbol_reference} with unit={target_pin_unit} found "
+                    f"(pin {pin_number}); falling back to first instance"
+                )
+
+            # Get symbol position, rotation, and mirror state
+            symbol_at = target_symbol.at.value
+            symbol_x = float(symbol_at[0])
+            symbol_y = float(symbol_at[1])
+            symbol_rotation = float(symbol_at[2]) if len(symbol_at) > 2 else 0.0
+
+            mirror_x = False
+            mirror_y = False
+            if hasattr(target_symbol, "mirror"):
+                mirror_val = (
+                    str(target_symbol.mirror.value)
+                    if hasattr(target_symbol.mirror, "value")
+                    else ""
+                )
+                if mirror_val == "x":
+                    mirror_x = True
+                elif mirror_val == "y":
+                    mirror_y = True
+
+            logger.debug(
+                f"Symbol {symbol_reference} unit {target_pin_unit}: pos=({symbol_x}, {symbol_y}), "
+                f"rot={symbol_rotation}, mirror_x={mirror_x}, mirror_y={mirror_y}, lib_id={lib_id}"
+            )
 
             # Get pin position relative to symbol origin.
             # lib_symbols uses library y-up convention; schematic uses y-down.
