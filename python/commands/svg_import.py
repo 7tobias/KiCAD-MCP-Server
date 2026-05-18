@@ -471,6 +471,135 @@ def _bounding_box(polygons: List[Polygon]) -> Tuple[float, float, float, float]:
 
 
 # ---------------------------------------------------------------------------
+# Hole detection + bridging
+# ---------------------------------------------------------------------------
+# KiCad gr_poly only stores ONE outline per polygon, so SVG paths with
+# inner counter holes (e.g. the letter "e") need to be converted into a
+# single non-simple polygon. We do this with the standard "bridge slit":
+# pick the closest pair of vertices on outer/inner, then walk outer until
+# that point, jump into the inner contour, walk it fully around, jump back
+# along the same edge. The slit has zero area, and even-odd fill (which
+# KiCad uses for self-touching polygons) correctly leaves the hole empty.
+
+def _polygon_signed_area(pts: Polygon) -> float:
+    n = len(pts)
+    s = 0.0
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return s / 2.0
+
+
+def _point_in_polygon(point: Point, polygon: Polygon) -> bool:
+    x, y = point
+    n = len(polygon)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = polygon[i]
+        xj, yj = polygon[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _polygon_contains_polygon(outer: Polygon, inner: Polygon) -> bool:
+    ox = [p[0] for p in outer]
+    oy = [p[1] for p in outer]
+    ix = [p[0] for p in inner]
+    iy = [p[1] for p in inner]
+    if min(ix) < min(ox) or max(ix) > max(ox):
+        return False
+    if min(iy) < min(oy) or max(iy) > max(oy):
+        return False
+    # Sample a few points on the inner polygon
+    n = len(inner)
+    samples = [inner[0], inner[n // 3], inner[n // 2], inner[(2 * n) // 3]]
+    return all(_point_in_polygon(p, outer) for p in samples)
+
+
+def _bridge_outer_with_hole(outer: Polygon, hole: Polygon) -> Polygon:
+    """
+    Merge a hole into its outer polygon by introducing a zero-width slit
+    between the closest pair of vertices. Result is a single closed polygon
+    that, when filled with even-odd rule, leaves the hole area empty.
+    """
+    # Strip duplicate closing points
+    outer_open = outer[:-1] if len(outer) > 1 and outer[0] == outer[-1] else outer[:]
+    hole_open = hole[:-1] if len(hole) > 1 and hole[0] == hole[-1] else hole[:]
+
+    # Find closest vertex pair (outer[i], hole[j])
+    best_i, best_j = 0, 0
+    best_d = float("inf")
+    for i, p in enumerate(outer_open):
+        for j, q in enumerate(hole_open):
+            d = (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2
+            if d < best_d:
+                best_d = d
+                best_i, best_j = i, j
+
+    n_h = len(hole_open)
+    # Walk hole starting at j around back to j (full loop, returning to start)
+    hole_walk = [hole_open[(best_j + k) % n_h] for k in range(n_h)]
+    hole_walk.append(hole_open[best_j])  # close the inner loop
+
+    bridged = (
+        outer_open[: best_i + 1]
+        + hole_walk
+        + [outer_open[best_i]]  # close the bridge slit
+        + outer_open[best_i + 1 :]
+    )
+    bridged.append(bridged[0])  # close the outer polygon
+    return bridged
+
+
+def _merge_polygons_with_holes(polygons: List[Polygon]) -> List[Polygon]:
+    """
+    Detect which polygons are holes inside other polygons (single level
+    of nesting, matching SVG fill-rule:evenodd intent for typical logos)
+    and bridge each (outer, holes) group into one polygon.
+    """
+    n = len(polygons)
+    if n < 2:
+        return polygons
+
+    # For each polygon, find its smallest containing parent (= the outer)
+    is_hole_of: List[Optional[int]] = [None] * n
+    for i in range(n):
+        best_parent = None
+        best_parent_area = float("inf")
+        for j in range(n):
+            if i == j:
+                continue
+            if _polygon_contains_polygon(polygons[j], polygons[i]):
+                area = abs(_polygon_signed_area(polygons[j]))
+                if area < best_parent_area:
+                    best_parent_area = area
+                    best_parent = j
+        is_hole_of[i] = best_parent
+
+    children: Dict[int, List[int]] = {}
+    for i, parent in enumerate(is_hole_of):
+        if parent is not None:
+            children.setdefault(parent, []).append(i)
+
+    result: List[Polygon] = []
+    for i in range(n):
+        if is_hole_of[i] is not None:
+            continue  # this polygon is a hole — gets merged into its parent
+        if i not in children:
+            result.append(polygons[i])
+        else:
+            merged = polygons[i]
+            for child_idx in children[i]:
+                merged = _bridge_outer_with_hole(merged, polygons[child_idx])
+            result.append(merged)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # gr_poly builder
 # ---------------------------------------------------------------------------
 def _build_gr_poly(points: List[Point], layer: str, stroke_width: float, filled: bool) -> str:
@@ -563,6 +692,10 @@ def import_svg_to_pcb(
 
         if not polygons:
             return {"success": False, "message": "No drawable shapes found in SVG"}
+
+        # --- 2b. Detect nested holes (e.g. counter inside letter "e") and
+        # bridge them into single polygons so KiCad renders the hole as empty.
+        polygons = _merge_polygons_with_holes(polygons)
 
         # --- 3. Compute bounding box of extracted polygons ---
         bx_min, by_min, bx_max, by_max = _bounding_box(polygons)
